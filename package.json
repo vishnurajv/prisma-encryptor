@@ -1,0 +1,23 @@
+{
+  "name": "prisma-encryptor",
+  "version": "0.1.0",
+  "description": "A Prisma extension for deterministic and non-deterministic field-level encryption with optional search indices.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "keywords": ["prisma", "encryption", "deterministic", "aes", "gcm", "middleware", "extension"],
+  "repository": { "type": "git", "url": "git+https://github.com/your-username/prisma-encryptor.git" },
+  "author": "Your Name <you@example.com>",
+  "license": "MIT",
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "jest"
+  },
+  "peerDependencies": { "@prisma/client": "^5.0.0" },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0"
+  }
+}

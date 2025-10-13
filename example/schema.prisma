@@ -1,0 +1,7 @@
+model User {
+  id         Int     @id @default(autoincrement())
+  name       String
+  email      String  // ciphertext base64
+  email_hmac String? @unique
+  ssn        String? // ciphertext
+}

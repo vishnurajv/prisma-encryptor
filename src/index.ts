@@ -1,165 +1,149 @@
 // src/index.ts
-import type { Prisma, PrismaClient } from "@prisma/client";
-import { mkKeysFromBuffer, encryptAEAD, decryptAEAD, hmacSha256, AES_KEY_LEN, HMAC_KEY_LEN } from "./crypto";
-import type { EncryptorConfig, KeyProvider, FieldConfig } from "./types";
+import type { PrismaClient } from "@prisma/client";
+import { mkKeysFromBuffer, encryptAEAD, decryptAEAD, hmacSha256 } from "./crypto";
+import type { EncryptorConfig, FieldConfig } from "./types";
+
+/**
+ * Prisma Encryptor Extension
+ * - Encrypts/decrypts configured fields automatically
+ * - Supports deterministic lookups via HMAC-based index fields
+ * - Adds model helpers: findUniqueWithHash(), findFirstWithHash(), findManyWithHash()
+ */
 
 type PreparedField = FieldConfig & { model: string; field: string };
 
 export function createPrismaEncryptor(config: EncryptorConfig) {
-  if (!config || !config.fields || !config.keyProvider) throw new Error("Missing config or keyProvider");
+  if (!config?.fields?.length || !config.keyProvider)
+    throw new Error("Invalid configuration: fields[] and keyProvider are required");
 
-  // normalize fields list
   const fieldsByModel = new Map<string, PreparedField[]>();
+
   for (const f of config.fields) {
-    if (f.deterministic && !f.indexField) {
-      throw new Error(`Field ${f.model}.${f.field} is deterministic but indexField is not provided.`);
-    }
-    const arr = fieldsByModel.get(f.model) ?? [];
-    arr.push(f as PreparedField);
-    fieldsByModel.set(f.model, arr);
+    if (f.deterministic && !f.indexField)
+      throw new Error(`Field ${f.model}.${f.field} is deterministic but indexField is missing.`);
+    const list = fieldsByModel.get(f.model) ?? [];
+    list.push(f as PreparedField);
+    fieldsByModel.set(f.model, list);
   }
 
   async function getKeys() {
-    // obtain encKey and hmacKey
-    const main = await Promise.resolve(config.keyProvider());
-    let encKey: Buffer;
-    let hmacKey: Buffer;
-    if (config.hmacKeyProvider) {
-      encKey = Buffer.isBuffer(main) ? main : Buffer.from(String(main), "utf8");
-      const hk = await Promise.resolve(config.hmacKeyProvider());
-      hmacKey = Buffer.isBuffer(hk) ? hk : Buffer.from(String(hk), "utf8");
-      if (encKey.length < AES_KEY_LEN || hmacKey.length < HMAC_KEY_LEN) {
-        throw new Error("Provided keys are too short; need >=32 bytes for each.");
-      }
-      encKey = encKey.slice(0, AES_KEY_LEN);
-      hmacKey = hmacKey.slice(0, HMAC_KEY_LEN);
-    } else {
-      const b = Buffer.isBuffer(main) ? main : Buffer.from(String(main), "utf8");
-      const k = mkKeysFromBuffer(b);
-      encKey = k.encKey;
-      hmacKey = k.hmacKey;
-    }
-    return { encKey, hmacKey };
+    const provided = await Promise.resolve(config.keyProvider());
+    const buf = Buffer.isBuffer(provided) ? provided : Buffer.from(String(provided), "utf8");
+    return mkKeysFromBuffer(buf);
   }
 
-  function findFieldConfig(model: string, field: string): PreparedField | undefined {
-    const arr = fieldsByModel.get(model);
-    if (!arr) return undefined;
-    return arr.find(f => f.field === field);
-  }
-
-  // apply to a Prisma client instance
-  function extendClient(client: PrismaClient) {
-    // $use middleware
-    client.$use(async (params, next) => {
-      // only act on models we know
-      const model = (params.model as string) || undefined;
-      if (!model || !fieldsByModel.has(model)) {
-        // still need to call next, and then maybe decrypt results if they contain encrypted fields via find/findMany?
-        const result = await next(params);
-        // decrypt result rows if applicable
-        return tryDecryptResult(result, model);
-      }
-
-      const keys = await getKeys();
-      const encKey = keys.encKey;
-      const hmacKey = keys.hmacKey;
-
-      // Intercept create and update and upsert: encrypt outgoing fields
-      if (params.action === "create" || params.action === "update" || params.action === "upsert") {
-        // handle data payload
-        const data = params.args?.data;
-        if (data) {
-          await encryptDataForModel(model, data, encKey, hmacKey);
-        }
-      }
-
-      // For findUnique/findFirst/findMany we call next then decrypt the returned rows.
-      const result = await next(params);
-      return tryDecryptResult(result, model, encKey, hmacKey);
-    });
-
-    return client;
-  }
-
+  /** Encrypt fields before writing to DB */
   async function encryptDataForModel(model: string, data: any, encKey: Buffer, hmacKey: Buffer) {
     const fields = fieldsByModel.get(model) || [];
     for (const f of fields) {
       const val = data[f.field];
-      // For nested updates / create, Prisma allows objects like { set: value } in update
-      // support common shapes
-      const extractPlain = (v: any) => {
-        if (v === null || v === undefined) return v;
-        if (typeof v === "object" && "set" in v) return v.set;
-        return v;
-      };
-      const setEncrypted = (enc: string | null) => {
-        if (typeof val === "object" && "set" in val) {
-          data[f.field].set = enc;
-        } else {
-          data[f.field] = enc;
-        }
-      };
-
-      const plain = extractPlain(val);
-      if (plain === null || plain === undefined) {
-        // if nulls allowed and deterministic index required, clear index too
-        if (f.deterministic && f.indexField) {
-          data[f.indexField] = null;
-        }
-        setEncrypted(null);
+      if (val === null || val === undefined) {
+        if (f.deterministic && f.indexField) data[f.indexField] = null;
         continue;
       }
 
-      const enc = encryptAEAD(encKey, String(plain));
-      setEncrypted(enc);
-
-      if (f.deterministic && f.indexField) {
-        const token = hmacSha256(hmacKey, String(plain));
-        // set index field on same data payload
-        data[f.indexField] = token;
-      }
+      data[f.field] = encryptAEAD(encKey, String(val));
+      if (f.deterministic && f.indexField)
+        data[f.indexField] = hmacSha256(hmacKey, String(val));
     }
   }
 
-  function tryDecryptResult(result: any, model?: string, encKey?: Buffer, hmacKey?: Buffer) {
-    // If no model known or no keys, attempt best-effort decrypt if present — but encryption requires keys.
-    // If encKey undefined, return result as-is.
-    if (!model || !fieldsByModel.has(model) || !encKey) return result;
-
-    const fields = fieldsByModel.get(model)!;
-
-    function decryptRow(row: any) {
-      if (!row || typeof row !== "object") return row;
+  /** Decrypt results */
+  function decryptResult(result: any, model: string, encKey: Buffer) {
+    if (!result || typeof result !== "object") return result;
+    const fields = fieldsByModel.get(model) || [];
+    const decryptRow = (row: any) => {
+      if (!row) return row;
       for (const f of fields) {
         const ct = row[f.field];
-        if (ct === null || ct === undefined) {
-          row[f.field] = ct;
-          continue;
-        }
-        try {
-          const dec = decryptAEAD(encKey, String(ct));
-          row[f.field] = dec;
-        } catch (err) {
-          // decrypt failed — leave as-is or optionally throw
-          // keep ciphertext if decryption fails
+        if (typeof ct === "string") {
+          try {
+            row[f.field] = decryptAEAD(encKey, ct);
+          } catch {
+            // ignore failed decrypt
+          }
         }
       }
       return row;
-    }
+    };
+    return Array.isArray(result) ? result.map(decryptRow) : decryptRow(result);
+  }
 
-    if (Array.isArray(result)) {
-      return result.map(decryptRow);
+  /** Converts where clause with plaintext deterministic fields → hashed index fields */
+  function transformWhereClause(where: Record<string, any>, fields: PreparedField[], hmacKey: Buffer) {
+    const patched: Record<string, any> = { ...where };
+    for (const f of fields) {
+      if (f.deterministic && f.indexField && where[f.field] !== undefined) {
+        const val = where[f.field];
+        if (val !== null && val !== undefined) {
+          patched[f.indexField] = hmacSha256(hmacKey, String(val));
+        }
+        delete patched[f.field];
+      }
     }
-    // prisma's result shape: single object or { count } for count
-    if (result && typeof result === "object" && ("count" in result)) {
-      // ignore
+    return patched;
+  }
+
+  /** Adds dynamic model helpers */
+  async function attachModelHelpers(client: PrismaClient) {
+    const { encKey, hmacKey } = await getKeys();
+
+    for (const [modelName, fields] of fieldsByModel.entries()) {
+      const model = (client as any)[modelName.toLowerCase()];
+      if (!model) continue;
+
+      /** findUniqueWithHash */
+      model.findUniqueWithHash = async (args: any) => {
+        const patchedWhere = transformWhereClause(args.where || {}, fields, hmacKey);
+        const result = await model.findUnique({ ...args, where: patchedWhere });
+        return decryptResult(result, modelName, encKey);
+      };
+
+      /** findFirstWithHash */
+      model.findFirstWithHash = async (args: any) => {
+        const patchedWhere = transformWhereClause(args.where || {}, fields, hmacKey);
+        const result = await model.findFirst({ ...args, where: patchedWhere });
+        return decryptResult(result, modelName, encKey);
+      };
+
+      /** findManyWithHash */
+      model.findManyWithHash = async (args: any) => {
+        const patchedWhere = transformWhereClause(args.where || {}, fields, hmacKey);
+        const result = await model.findMany({ ...args, where: patchedWhere });
+        return decryptResult(result, modelName, encKey);
+      };
+    }
+  }
+
+  /** Core middleware registration */
+  function extendClient(client: PrismaClient) {
+    client.$use(async (params, next) => {
+      const model = params.model as string;
+      if (!model || !fieldsByModel.has(model)) return next(params);
+
+      const { encKey, hmacKey } = await getKeys();
+
+      // Encrypt writes
+      if (["create", "update", "upsert"].includes(params.action)) {
+        const data = params.args?.data;
+        if (data) await encryptDataForModel(model, data, encKey, hmacKey);
+      }
+
+      const result = await next(params);
+
+      // Decrypt reads
+      if (["findUnique", "findFirst", "findMany"].includes(params.action))
+        return decryptResult(result, model, encKey);
+
       return result;
-    }
-    if (result && typeof result === "object") {
-      return decryptRow(result);
-    }
-    return result;
+    });
+
+    // Attach model helpers
+    attachModelHelpers(client).catch(err =>
+      console.error("Failed to attach model helpers:", err)
+    );
+
+    return client;
   }
 
   return { extendClient };

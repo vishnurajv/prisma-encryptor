@@ -5,8 +5,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "keywords": ["prisma", "encryption", "deterministic", "aes", "gcm", "middleware", "extension"],
-  "repository": { "type": "git", "url": "git+https://github.com/your-username/prisma-encryptor.git" },
-  "author": "Your Name <you@example.com>",
+  "repository": { "type": "git", "url": "git+https://github.com/vishnurajv/prisma-encryptor.git" },
+  "author": "Vishnu Raj <you@example.com>",
   "license": "MIT",
   "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
